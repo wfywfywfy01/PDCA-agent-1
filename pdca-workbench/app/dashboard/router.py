@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Annotated
 
 import asyncio
-import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
@@ -16,23 +15,13 @@ from app.auth.deps import require_role
 from app.auth.models import User
 from app.dashboard import service
 from app.database import get_session
-from app.auth.scope import normalize_scope_key, resolve_data_scope, visible_dealer_names
+from app.auth.scope import is_reporting_store, normalize_scope_key, resolve_data_scope, visible_dealer_names
 from app.legacy import bridge
 from app.validation import require_iso_date
 from app.models.dealer_store import DealerStore
 from app.models.walkin_daily_report import WalkinDailyReport
 
 router = APIRouter(tags=["dashboard"])
-
-
-def _is_non_business_store(row: DealerStore) -> bool:
-    store_id = str(row.store_id or "").strip().casefold()
-    name = str(row.name or "").strip().casefold()
-    return bool(
-        re.match(r"^(qa|test|demo)([-_ ]|$)", store_id)
-        or re.match(r"^(qa|test|demo)([-_ ]|$)", name)
-        or name.startswith(("测试", "演示"))
-    )
 
 
 def _date_or_today(value: str | None) -> str:
@@ -132,7 +121,7 @@ async def workbench_today(
         select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
     ).all())
     business_store_ids = {
-        row.store_id for row in active_stores if not _is_non_business_store(row)
+        row.store_id for row in active_stores if is_reporting_store(row)
     }
     store_ids = (
         business_store_ids
@@ -356,7 +345,7 @@ async def sell_out(
         stores = session.exec(
             select(DealerStore).where(DealerStore.store_id.in_(visible_ids))
         ).all() if visible_ids else []
-        store_ids = [row.store_id for row in stores if not _is_non_business_store(row)]
+        store_ids = [row.store_id for row in stores if is_reporting_store(row)]
         latest = session.exec(
             select(func.max(WalkinDailyReport.report_date)).where(
                 WalkinDailyReport.report_date <= date_text,

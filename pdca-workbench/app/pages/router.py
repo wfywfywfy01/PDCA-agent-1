@@ -9,7 +9,7 @@ from typing import Annotated
 from urllib.parse import quote, urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from loguru import logger
 from sqlmodel import Session
 
@@ -152,11 +152,24 @@ async def home(
     settings = get_settings()
     if settings.home_redirect:
         return RedirectResponse(settings.home_redirect)
+    return _home_dashboard(settings)
+
+
+def _home_dashboard(settings):
     index = settings.home_dashboard_dir / "index.html"
     if not index.is_file():
         # MVP 目录未部署，降级到录入页
         return _unavailable("经营首页")
     return html_page(index.read_text(encoding="utf-8"))
+
+
+@router.get("/app")
+@router.get("/app/")
+async def app_home(
+    user: Annotated[User, Depends(get_current_user)] = None,
+):
+    """兼容历史首页地址，避免 PDCA_HOME_REDIRECT=/app/ 登录后落到 404。"""
+    return _home_dashboard(get_settings())
 
 
 @router.get("/login")
@@ -167,6 +180,11 @@ async def login_page():
     if login.is_file():
         return _html_file(login)
     return HTMLResponse("<p>login.html 缺失</p>")
+
+
+@router.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 @router.get("/home-classic")

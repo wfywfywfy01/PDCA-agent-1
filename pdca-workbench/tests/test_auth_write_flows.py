@@ -445,6 +445,36 @@ class AuthAndWriteFlowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["closure"]["expected"], 2)
 
+    def test_admin_walkin_payload_excludes_qa_store(self):
+        with Session(self.engine) as session:
+            session.add(DealerStore(
+                store_id="qa-test-01",
+                name="QA测试门店（可删除）",
+                team_key="overseas",
+                is_active=True,
+            ))
+            session.commit()
+        payload = {
+            "meta": {"storeCount": 2},
+            "stores": [
+                {"id": "store-a", "name": "Dealer A"},
+                {"id": "qa-test-01", "name": "QA测试门店（可删除）"},
+            ],
+            "staff": [
+                {"id": "real", "storeId": "store-a"},
+                {"id": "qa", "storeId": "qa-test-01"},
+            ],
+        }
+        self.assertEqual(self._login("admin").status_code, 200)
+        with (
+            patch("app.walkin.router.bridge.build_walkin_payload", return_value=payload),
+            patch("app.walkin.router._merge_five_kit_into_payload", side_effect=lambda value, *_: value),
+        ):
+            response = self.client.get("/api/walkin?month=2024-01&date=2024-01-31")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row["id"] for row in response.json()["stores"]], ["store-a"])
+        self.assertEqual(response.json()["meta"]["storeCount"], 1)
+
     def test_workbench_uses_database_logistics_without_csv_directory(self):
         with Session(self.engine) as session:
             session.add(LogisticsShipment(

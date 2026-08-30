@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from app.audit import log_action
 from app.auth.deps import get_current_user, require_role
 from app.auth.models import User
-from app.auth.scope import scoped_active_store_ids, visible_dealer_names, visible_store_ids
+from app.auth.scope import is_reporting_store, scoped_active_store_ids, visible_dealer_names, visible_store_ids
 from app.config import get_settings
 from app.database import get_session
 from app.legacy import bridge
@@ -122,7 +122,10 @@ async def get_my_stores(
         if not allowed:
             return []
         stmt = stmt.where(DealerStore.store_id.in_(allowed))
-    stores = session.exec(stmt.order_by(DealerStore.region, DealerStore.sort_order)).all()
+    stores = [
+        row for row in session.exec(stmt.order_by(DealerStore.region, DealerStore.sort_order)).all()
+        if is_reporting_store(row)
+    ]
     return [
         {
             "store_id": s.store_id,
@@ -217,10 +220,7 @@ def _dealer_ids_for_user(user: User, session) -> list[str] | None:
 
 def _filter_walkin_payload(payload: dict, user: User, session) -> dict:
     """按统一权限范围过滤 walkin payload 里的 stores 和 staff。"""
-    allowed = visible_store_ids(user, session)
-    if allowed is None:
-        return payload
-    allowed_set = set(allowed)
+    allowed_set = set(scoped_active_store_ids(user, session))
 
     if not allowed_set:
         payload["stores"] = []

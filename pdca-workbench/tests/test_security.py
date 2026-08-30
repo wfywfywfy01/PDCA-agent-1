@@ -187,6 +187,9 @@ class RouteRegistrationTests(unittest.TestCase):
     def test_public_workbench_routes_are_registered(self):
         paths = {route.path for route in app.routes}
         expected = {
+            "/app",
+            "/app/",
+            "/favicon.ico",
             "/pdca-vps",
             "/dashboard",
             "/signalseller-center/",

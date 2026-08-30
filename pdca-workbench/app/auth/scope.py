@@ -8,6 +8,7 @@ see.  Business routers should not recreate ownership rules themselves.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from sqlmodel import Session, select
 
@@ -24,6 +25,19 @@ ROLE_DEFAULT_SCOPES = {
     "manager": "team",
     "admin": "all",
 }
+
+
+def is_reporting_store(store: DealerStore) -> bool:
+    """Exclude anchored QA/demo master rows without hiding real names containing those words."""
+    store_id = str(store.store_id or "").strip().casefold()
+    name = str(store.name or "").strip().casefold()
+    return not bool(
+        re.match(r"^(qa|test|demo)([-_ ]|$)", store_id)
+        or re.match(r"^(qa|test|demo)([-_ ]|$)", name)
+        or name.startswith(("测试", "演示"))
+    )
+
+
 def normalize_scope_key(value: str | None) -> str:
     return " ".join(str(value or "").strip().casefold().split())
 
@@ -101,7 +115,7 @@ def resolve_data_scope(user: User, session: Session) -> DataScope:
         return DataScope(mode="none", store_ids=(), dealer_names=(), owner_keys=())
 
     stmt = select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
-    stores = list(session.exec(stmt).all())
+    stores = [row for row in session.exec(stmt).all() if is_reporting_store(row)]
 
     if user.role == "dealer":
         allowed_id = str(user.dealer_id or "").strip()
@@ -178,20 +192,21 @@ def scoped_active_store_ids(user: User, session: Session) -> list[str]:
     visible = visible_store_ids(user, session)
     if visible is not None:
         return visible
-    return list(session.exec(
-        select(DealerStore.store_id).where(DealerStore.is_active == True)  # noqa: E712
-    ).all())
+    stores = session.exec(
+        select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
+    ).all()
+    return [row.store_id for row in stores if is_reporting_store(row)]
 
 
 def scoped_active_dealer_names(user: User, session: Session) -> list[str]:
     """Return active dealer names inside the user's scope, including admins."""
     visible = visible_store_ids(user, session)
-    stmt = select(DealerStore.name).where(DealerStore.is_active == True)  # noqa: E712
+    stmt = select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
     if visible is not None:
         if not visible:
             return []
         stmt = stmt.where(DealerStore.store_id.in_(visible))
-    return list(session.exec(stmt).all())
+    return [row.name for row in session.exec(stmt).all() if is_reporting_store(row)]
 
 
 def sync_user_dealer_assignments(user: User, session: Session) -> list[str]:
@@ -210,7 +225,10 @@ def sync_user_dealer_assignments(user: User, session: Session) -> list[str]:
     stores = session.exec(
         select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
     ).all()
-    assigned = [row.store_id for row in stores if normalize_scope_key(row.sales_owner) == owner_key]
+    assigned = [
+        row.store_id for row in stores
+        if is_reporting_store(row) and normalize_scope_key(row.sales_owner) == owner_key
+    ]
     for store_id in assigned:
         session.add(DealerAssignment(user_id=user.id, store_id=store_id))
     session.flush()
