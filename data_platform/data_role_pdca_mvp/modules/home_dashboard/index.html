@@ -318,8 +318,10 @@
             sellIn.amount != null ? ('¥ ' + Math.round(sellIn.amount).toLocaleString()) : null, sellIn.note);
         } catch (err) {
           await overviewTask;
-          if (overview) {
+          if (currentPeriod === 'month' && overview) {
             renderSellCard(sellInAmount, document.getElementById('sellInFoot'), overview.sellInWan, overview.sellInAmount, overview.sellInSub);
+          } else {
+            renderSellCard(sellInAmount, document.getElementById('sellInFoot'), null, '—', '当前周期 Sell-in 数据不可用');
           }
           throw err;
         }
@@ -332,8 +334,10 @@
             sellOut.amount != null ? ('¥ ' + Math.round(sellOut.amount).toLocaleString()) : null, sellOut.note);
         } catch (err) {
           await overviewTask;
-          if (overview) {
+          if (currentPeriod === 'month' && overview) {
             renderSellCard(sellOutAmount, document.getElementById('sellOutFoot'), overview.sellOutWan, overview.sellOutAmount, overview.sellOutSub);
+          } else {
+            renderSellCard(sellOutAmount, document.getElementById('sellOutFoot'), null, '—', '当前周期终销数据不可用');
           }
           throw err;
         }
@@ -367,13 +371,16 @@
         return '<'+tag+' class="action-row"'+(item.href?' href="'+escapeHtml(item.href)+'"':'')+'><strong>'+escapeHtml(item.title)+'</strong><span>'+escapeHtml(item.message)+'</span></'+tag+'>';
       }).join('') || '<div class="empty-hint">暂无可识别行动</div>';
       const closure = data.closure||{};
-      closureValue.textContent = closure.expected ? (closure.reported+'/'+closure.expected) : '—';
-      closureNote.textContent = closure.expected ? (closure.complete?'今日门店上报已闭环':'仍有 '+(closure.expected-closure.reported)+' 家待上报') : '账号未绑定可见门店';
+      const rosterConfirmed = closure.roster_state === 'confirmed';
+      closureValue.textContent = rosterConfirmed ? (closure.reported+'/'+closure.expected) : '—';
+      closureNote.textContent = rosterConfirmed
+        ? (closure.complete?'今日门店上报已闭环':'仍有 '+(closure.expected-closure.reported)+' 家待上报 · 启用门店主数据')
+        : '应报名单尚未确认';
     }
 
     function renderCustomers(data) {
       if (!data || !data.length) {
-        customerCenter.innerHTML = '<div class="empty-hint">暂无客户分层数据</div>';
+        customerCenter.innerHTML = '<div class="empty-hint">客户与跟进数据由自动化获客管理，请进入“详情”按当前账号权限查看。未接通汇总接口前，本页不展示旧台账或估算值。</div>';
         return;
       }
       customerCenter.innerHTML = data.map(function (item) {
@@ -384,8 +391,8 @@
           '<div class="metric-body">' +
           '<div class="metric-label">' + escapeHtml(item.level) + ' 类客户</div>' +
           '<div class="metric-value"><span class="amount-num">' + item.total + '<span class="amount-unit">家</span></span></div>' +
-          '<div class="metric-foot">触达 ' + (touchedKnown?item.touched:'未同步') + '/' + item.target + '</div>' +
-          '<div class="progress"><span style="width:' + width + '%"></span></div>' +
+          '<div class="metric-foot">' + (touchedKnown?('本月触达 '+item.touched+'/'+item.target):'本月触达数据尚未接通') + '</div>' +
+          (touchedKnown?('<div class="progress"><span style="width:' + width + '%"></span></div>'):'') +
           '</div></div>'
         );
       }).join('');

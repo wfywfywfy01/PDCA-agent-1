@@ -5,22 +5,34 @@ from __future__ import annotations
 from typing import Annotated
 
 import asyncio
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from app.auth.deps import require_role
 from app.auth.models import User
 from app.dashboard import service
 from app.database import get_session
-from app.auth.scope import resolve_data_scope, visible_dealer_names
+from app.auth.scope import normalize_scope_key, resolve_data_scope, visible_dealer_names
 from app.legacy import bridge
 from app.validation import require_iso_date
 from app.models.dealer_store import DealerStore
 from app.models.walkin_daily_report import WalkinDailyReport
 
 router = APIRouter(tags=["dashboard"])
+
+
+def _is_non_business_store(row: DealerStore) -> bool:
+    store_id = str(row.store_id or "").strip().casefold()
+    name = str(row.name or "").strip().casefold()
+    return bool(
+        re.match(r"^(qa|test|demo)([-_ ]|$)", store_id)
+        or re.match(r"^(qa|test|demo)([-_ ]|$)", name)
+        or name.startswith(("测试", "演示"))
+    )
 
 
 def _date_or_today(value: str | None) -> str:
@@ -116,13 +128,17 @@ async def workbench_today(
     """Return truthful, scoped facts and next actions for the current account."""
     date_text = _date_or_today(date)
     scope = resolve_data_scope(user, session)
-    if scope.unrestricted:
-        stores = list(session.exec(
-            select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
-        ).all())
-        store_ids = {row.store_id for row in stores}
-    else:
-        store_ids = set(scope.store_ids)
+    active_stores = list(session.exec(
+        select(DealerStore).where(DealerStore.is_active == True)  # noqa: E712
+    ).all())
+    business_store_ids = {
+        row.store_id for row in active_stores if not _is_non_business_store(row)
+    }
+    store_ids = (
+        business_store_ids
+        if scope.unrestricted
+        else business_store_ids.intersection(scope.store_ids)
+    )
 
     report_stmt = select(WalkinDailyReport).where(WalkinDailyReport.report_date == date_text)
     if store_ids:
@@ -134,23 +150,36 @@ async def workbench_today(
     expected = len(store_ids)
     missing = max(expected - len(reported_ids), 0)
 
-    # Logistics currently comes from its canonical CSV/tracking merge.  An
-    # absent source directory is explicitly "missing", never a synthetic zero.
-    from app.config import get_settings
+    # load_shipments merges the canonical database and file sources.  Source
+    # availability is determined from actual rows, not from one CSV directory.
     from app.logistics import service as logistics_service
     from app.logistics.router import _scoped_shipments
 
-    logistics_source = get_settings().mvp_root / "inputs" / "logistics"
-    if logistics_source.is_dir() and any(logistics_source.glob("*_tracking.csv")):
-        shipments, _ = _scoped_shipments(logistics_service.load_shipments("all"), user, session)
+    shipments, logistics_source_state = logistics_service.load_shipments("all", return_state=True)
+    shipments, _ = _scoped_shipments(shipments, user, session)
+    if logistics_source_state in {"available", "mixed"}:
         logistics_summary = logistics_service.build_summary(shipments)
         logistics_fact = _fact(
             logistics_summary.get("abnormal", 0) + logistics_summary.get("pending", 0),
             "available",
-            "logistics_tracking",
+            "logistics_db" if logistics_source_state == "available" else "logistics_db_csv_history",
             date_text,
             scope.mode,
-            "异常与待核查运单",
+            "异常与待核查运单" + ("；含 CSV 历史补充" if logistics_source_state == "mixed" else ""),
+        )
+    elif logistics_source_state in {"degraded", "historical"}:
+        logistics_summary = logistics_service.build_summary(shipments)
+        logistics_fact = _fact(
+            logistics_summary.get("abnormal", 0) + logistics_summary.get("pending", 0),
+            "degraded",
+            "logistics_csv_fallback",
+            date_text,
+            scope.mode,
+            (
+                "物流数据库不可用；仅有 CSV 历史兜底，未作为实时事实展示"
+                if logistics_source_state == "degraded"
+                else "物流数据库当前无记录；仅有 CSV 历史数据，未作为实时事实展示"
+            ),
         )
     else:
         logistics_fact = _fact(
@@ -219,6 +248,8 @@ async def workbench_today(
             "reported": len(reported_ids),
             "expected": expected,
             "complete": expected > 0 and missing == 0,
+            "roster_state": "confirmed",
+            "roster_source": "dealer_store_db",
         },
     }
 
@@ -226,7 +257,7 @@ async def workbench_today(
 @router.get("/api/dashboard/overview")
 async def overview(
     date: str | None = None,
-    period: str = Query("day"),
+    period: str = Query("day", pattern=r"^(day|week|month|quarter)$"),
     user: Annotated[User, Depends(require_role("viewer"))] = None,
     session: Annotated[Session, Depends(get_session)] = None,
 ):
@@ -271,13 +302,23 @@ async def dashboard_refresh(
 @router.get("/api/dashboard/sell-in")
 async def sell_in(
     date: str | None = None,
-    period: str = Query("day"),
+    period: str = Query("day", pattern=r"^(day|week|month|quarter)$"),
     user: Annotated[User, Depends(require_role("viewer"))] = None,
     session: Annotated[Session, Depends(get_session)] = None,
 ):
     from app.vertu.sales import fetch_sell_in
     date_text = _date_or_today(date)
     if not resolve_data_scope(user, session).unrestricted:
+        if period != "month":
+            return {
+                "amount": None,
+                "wan": None,
+                "note": "当前账号的日/周/季 Sell-in 明细源尚未接通",
+                "as_of": None,
+                "source": "missing",
+                "cached": False,
+                "state": "missing",
+            }
         data = service.workbench_overview(date_text, period, _session_user(user, session))
         data = service.merge_db_sales(data, date_text, session, user)
         return _sales_payload(data, "sellIn")
@@ -285,6 +326,16 @@ async def sell_in(
         return await fetch_sell_in(date_text, period)
     except Exception as exc:
         logger.warning("vertu sell-in 失败，回退数据库快照: {}", exc)
+        if period != "month":
+            return {
+                "amount": None,
+                "wan": None,
+                "note": "当前周期 Sell-in 实时源不可用",
+                "as_of": None,
+                "source": "missing",
+                "cached": False,
+                "state": "missing",
+            }
         data = service.workbench_overview(date_text, period, _session_user(user, session))
         data = service.merge_db_sales(data, date_text, session, user)
         return _sales_payload(data, "sellIn")
@@ -293,11 +344,35 @@ async def sell_in(
 @router.get("/api/dashboard/sell-out")
 async def sell_out(
     date: str | None = None,
-    period: str = Query("day"),
+    period: str = Query("day", pattern=r"^(day|week|month|quarter)$"),
     user: Annotated[User, Depends(require_role("viewer"))] = None,
     session: Annotated[Session, Depends(get_session)] = None,
 ):
     date_text = _date_or_today(date)
+    if period != "month":
+        from app.auth.scope import scoped_active_store_ids
+
+        visible_ids = set(scoped_active_store_ids(user, session))
+        stores = session.exec(
+            select(DealerStore).where(DealerStore.store_id.in_(visible_ids))
+        ).all() if visible_ids else []
+        store_ids = [row.store_id for row in stores if not _is_non_business_store(row)]
+        latest = session.exec(
+            select(func.max(WalkinDailyReport.report_date)).where(
+                WalkinDailyReport.report_date <= date_text,
+                WalkinDailyReport.dealer_id.in_(store_ids),
+            )
+        ).one() if store_ids else None
+        return {
+            "amount": None,
+            "wan": None,
+            "note": "日/周/季终销金额源尚未接通" + (f"；最近五件套回执 {latest}" if latest else ""),
+            "as_of": latest,
+            "source": "five_kit_db" if latest else "missing",
+            "cached": False,
+            "state": "missing",
+            "latest_available_date": latest,
+        }
     # vertu-cli 2.x does not provide a dealer Sell-out shortcut. The scoped
     # database snapshot is the authoritative source and avoids a guaranteed
     # failing remote call on every homepage visit.
@@ -311,6 +386,13 @@ async def customer_center(
     user: Annotated[User, Depends(require_role("viewer"))] = None,
     session: Annotated[Session, Depends(get_session)] = None,
 ):
+    from app.config import get_settings
+
+    if getattr(get_settings(), "acquisition_enabled", False):
+        # The acquisition workspace owns customer/follow-up facts.  Until it
+        # exposes a scoped summary API, do not display stale local reference
+        # rows as current customer activity.
+        return []
     session_user = _session_user(user, session)
     return _bridge_call(bridge.api_customer_center_summary, session_user, default=[])
 
@@ -327,7 +409,7 @@ async def task_center_summary(
 
 @router.get("/api/dealer/sellin-summary")
 async def dealer_sellin_summary(
-    month: str = Query(""),
+    month: str = Query("", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
     user: Annotated[User, Depends(require_role("viewer"))] = None,
     session: Annotated[Session, Depends(get_session)] = None,
 ):
@@ -354,6 +436,40 @@ async def dealer_sellin_summary(
     )
     scoped["has_data"] = bool(scoped["dealers"])
     scoped["trend"] = []
+    return scoped
+
+
+@router.get("/api/dealer/sellin-salespeople")
+async def dealer_sellin_salespeople(
+    month: str = Query("", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
+    user: Annotated[User, Depends(require_role("viewer"))] = None,
+    session: Annotated[Session, Depends(get_session)] = None,
+):
+    from datetime import date as _date
+    from app.vertu.sales import fetch_salesperson_breakdown
+
+    try:
+        data = await fetch_salesperson_breakdown(month or _date.today().strftime("%Y-%m"))
+    except Exception as exc:
+        logger.warning("vertu 销售人员汇总失败: {}", exc)
+        raise HTTPException(status_code=503, detail="销售人员 Sell-in 暂时不可用") from exc
+    scope = resolve_data_scope(user, session)
+    if scope.unrestricted:
+        return data
+    allowed = {
+        normalize_scope_key(value)
+        for value in (*scope.owner_keys, getattr(user, "sales_name", ""))
+        if value
+    }
+    scoped = dict(data)
+    scoped["rows"] = [
+        row for row in data.get("rows", [])
+        if normalize_scope_key(row.get("name", "")) in allowed
+    ]
+    for rank, row in enumerate(scoped["rows"], start=1):
+        row["rank"] = rank
+    scoped["total_wan"] = round(sum(row["amount_wan"] for row in scoped["rows"]), 2)
+    scoped["has_data"] = bool(scoped["rows"])
     return scoped
 
 

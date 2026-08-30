@@ -259,3 +259,68 @@ async def fetch_sellin_summary(month: str | None = None) -> dict:
         "trend": trend,
         "source": "vertu-cli sales +orders",
     }
+
+
+async def fetch_salesperson_breakdown(month: str) -> dict:
+    """Return actionable Sell-in ranking without masked customer identities."""
+    period = _trend_months(month)[-1]
+    end = min(_date.fromisoformat(period["end"]), _date.today())
+    configured = os.environ.get(
+        "PDCA_VERTU_SELLIN_DEPARTMENTS",
+        "经销商一部,经销商二部,经销商三部",
+    )
+    departments = [item.strip() for item in configured.split(",") if item.strip()]
+
+    async def fetch_department(department: str = "") -> dict:
+        args = [
+            "sales",
+            "+dept-breakdown",
+            "--start-date",
+            period["start"],
+            "--end-date",
+            str(end),
+            "--dept-l1",
+            os.environ.get("PDCA_VERTU_DEPT_L1", "海外渠道"),
+            "--group-by",
+            "salesperson",
+            "--limit",
+            "5000",
+        ]
+        if department:
+            args += ["--dept-l2", department]
+        payload = await run_vertu_json(args, timeout=20.0)
+        if not isinstance(payload, dict):
+            raise RuntimeError("vertu-cli 销售人员汇总返回格式异常")
+        return payload
+
+    payloads = await asyncio.gather(
+        *(fetch_department(department) for department in departments)
+    ) if departments else [await fetch_department()]
+    grouped: dict[str, dict] = {}
+    for raw in (row for payload in payloads for row in (payload.get("rows") or [])):
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        item = grouped.setdefault(name, {"name": name, "amount": 0.0, "quantity": 0, "orders": 0})
+        item["amount"] += float(raw.get("amount") or 0)
+        item["quantity"] += int(raw.get("qty") or 0)
+        item["orders"] += int(raw.get("orders") or 0)
+    ordered = sorted(grouped.values(), key=lambda item: -item["amount"])
+    rows = [
+        {
+            "rank": rank,
+            "name": item["name"],
+            "amount_wan": round(item["amount"] / 10000, 2),
+            "quantity": item["quantity"],
+            "orders": item["orders"],
+        }
+        for rank, item in enumerate(ordered, start=1)
+    ]
+    return {
+        "month": month,
+        "rows": rows,
+        "total_wan": round(sum(row["amount_wan"] for row in rows), 2),
+        "has_data": bool(rows),
+        "source": "vertu-cli sales +dept-breakdown",
+        "as_of": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }

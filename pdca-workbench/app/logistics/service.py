@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import datetime
 from pathlib import Path
+
+from loguru import logger
 
 from app.config import get_settings
 from app.legacy import bridge
@@ -30,13 +33,17 @@ _PLACEHOLDER_TRACKING_NUMBERS = {"1Z0000000000000000"}
 def _is_demo_record(row: dict) -> bool:
     """识别明确的演示/占位运单，避免测试数据进入生产看板。"""
     tracking = str(row.get("tracking_number") or "").strip().upper()
-    if tracking in _PLACEHOLDER_TRACKING_NUMBERS:
+    if tracking in _PLACEHOLDER_TRACKING_NUMBERS or tracking.startswith(("TEST", "DEMO", "QA-")):
         return True
-    labels = " ".join(
-        str(row.get(key) or "")
-        for key in ("customer", "note", "salesperson")
-    ).casefold()
-    return any(token in labels for token in ("演示", "测试客户", "demo", "mock"))
+    customer = str(row.get("customer") or "").strip().casefold()
+    salesperson = str(row.get("salesperson") or "").strip().casefold()
+    note = str(row.get("note") or "").strip().casefold()
+    return (
+        customer.startswith(("演示客户", "测试客户"))
+        or bool(re.match(r"^(demo|mock)([-_ ]|$)", customer))
+        or bool(re.match(r"^(demo|mock)([-_ ]|$)", salesperson))
+        or note in {"测试", "test", "qa"}
+    )
 
 
 def _read_csv(path: Path) -> list[dict]:
@@ -269,18 +276,22 @@ def _enrich_row(
 
 def list_available_dates() -> list[str]:
     """有物流录入数据的日期列表（新→旧）。"""
-    inputs_dir = get_settings().mvp_root / "inputs" / "logistics"
-    if not inputs_dir.is_dir():
-        return []
-    dates = []
-    for csv_path in inputs_dir.glob("*_tracking.csv"):
+    settings = get_settings()
+    inputs_dir = settings.mvp_root / "inputs" / "logistics"
+    dates = {
+        str(row.get("record_date") or "")
+        for row in (_load_db_rows("all") or [])
+        if row.get("record_date")
+        and (settings.include_demo_data or not _is_demo_record(row))
+    }
+    for csv_path in inputs_dir.glob("*_tracking.csv") if inputs_dir.is_dir() else []:
         rows = _read_csv(csv_path)
         if any(
             (r.get("tracking_number") or "").strip()
-            and (get_settings().include_demo_data or not _is_demo_record(r))
+            and (settings.include_demo_data or not _is_demo_record(r))
             for r in rows
         ):
-            dates.append(csv_path.stem.replace("_tracking", ""))
+            dates.add(csv_path.stem.replace("_tracking", ""))
     return sorted(dates, reverse=True)
 
 
@@ -308,14 +319,50 @@ def load_auto_status_map() -> dict[str, object]:
         return {}
 
 
+def _load_db_rows(date_text: str | None = None) -> list[dict] | None:
+    """Read canonical logistics rows; CSV remains a history fallback."""
+    try:
+        from sqlmodel import Session, select
+        from app.database import get_engine
+        from app.models.logistics import LogisticsShipment
+
+        stmt = select(LogisticsShipment)
+        if date_text and date_text != "all":
+            stmt = stmt.where(LogisticsShipment.record_date == date_text)
+        with Session(get_engine()) as session:
+            rows = list(session.exec(stmt).all())
+    except Exception as exc:
+        logger.warning("读取 logistics_shipments 失败: {}", exc)
+        return None
+    return [
+        {
+            "record_date": row.record_date,
+            "tracking_number": row.tracking_number,
+            "carrier": row.carrier,
+            "customer": row.customer,
+            "salesperson": row.salesperson,
+            "ship_date": row.ship_date,
+            "expected_status": row.expected_status,
+            "current_status": row.current_status,
+            "note": row.note,
+            "tracking_url": row.tracking_url,
+            "judgement": row.judgement,
+            "reason": row.reason,
+            "progress_pct": row.progress_pct,
+        }
+        for row in rows
+    ]
+
+
 def load_shipments(
     date_text: str | None = None,
     salesperson: str | None = None,
     status_group: str = "all",
     query: str = "",
     open_only: bool = False,
-) -> list[dict]:
-    """合并 inputs 与 outputs 物流数据。"""
+    return_state: bool = False,
+) -> list[dict] | tuple[list[dict], str]:
+    """合并运单数据：数据库优先，CSV 仅补充未迁移历史。"""
     settings = get_settings()
     inputs_dir = settings.mvp_root / "inputs" / "logistics"
     outputs_dir = settings.mvp_root / "outputs"
@@ -328,10 +375,18 @@ def load_shipments(
     auto_map = load_auto_status_map()
     merged: dict[str, dict] = {}
 
-    if not inputs_dir.is_dir():
-        return []
+    db_rows = _load_db_rows(date_text)
+    db_available = db_rows is not None
+    for row in db_rows or []:
+        tracking = (row.get("tracking_number") or "").strip()
+        if not tracking or (not settings.include_demo_data and _is_demo_record(row)):
+            continue
+        sourced = {**row, "data_source": "logistics_db"}
+        merged[tracking] = _enrich_row(
+            sourced, carriers, cfg, row.get("record_date") or ref_date, ref_date, auto_map
+        )
 
-    for csv_path in sorted(inputs_dir.glob("*_tracking.csv")):
+    for csv_path in sorted(inputs_dir.glob("*_tracking.csv")) if inputs_dir.is_dir() else []:
         file_date = csv_path.stem.replace("_tracking", "")
         if date_text and date_text != "all" and file_date != date_text:
             continue
@@ -342,11 +397,12 @@ def load_shipments(
         }
         for row in _read_csv(csv_path):
             tracking = (row.get("tracking_number") or "").strip()
-            if not tracking:
+            if not tracking or tracking in merged:
                 continue
             if not settings.include_demo_data and _is_demo_record(row):
                 continue
             enriched = dict(row)
+            enriched["data_source"] = "csv_history"
             if tracking in results_by_tracking:
                 enriched.update(results_by_tracking[tracking])
             merged[tracking] = _enrich_row(enriched, carriers, cfg, file_date, ref_date, auto_map)
@@ -358,7 +414,19 @@ def load_shipments(
         rows = [r for r in rows if not r.get("is_delivered")]
     rows = [r for r in rows if _match_status_group(r, status_group)]
     rows = [r for r in rows if _match_search(r, query)]
-    return _sort_shipments(rows)
+    result = _sort_shipments(rows)
+    if return_state:
+        sources = {row.get("data_source") for row in result}
+        if not db_available:
+            source_state = "degraded"
+        elif sources == {"logistics_db"} or not result:
+            source_state = "available"
+        elif "logistics_db" in sources:
+            source_state = "mixed"
+        else:
+            source_state = "historical"
+        return result, source_state
+    return result
 
 
 def build_summary(shipments: list[dict]) -> dict:

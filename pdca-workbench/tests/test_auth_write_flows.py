@@ -15,6 +15,7 @@ from app.auth.models import User
 from app.auth.security import hash_password, verify_password
 from app.database import get_session
 from app.main import app
+from app.logistics import service as logistics_service
 from app.models.daily_report import DailyReport
 from app.models.dealer_store import DealerStore
 from app.models.dealer_assignment import DealerAssignment
@@ -429,6 +430,160 @@ class AuthAndWriteFlowTests(unittest.TestCase):
         self.assertEqual(payload["facts"]["walkin_reported"]["value"], 1)
         self.assertEqual(payload["facts"]["walkin_visits"]["value"], 0)
         self.assertTrue(payload["closure"]["complete"])
+        self.assertEqual(payload["closure"]["roster_state"], "confirmed")
+
+    def test_admin_workbench_excludes_qa_store_from_expected_roster(self):
+        with Session(self.engine) as session:
+            session.add_all([
+                DealerStore(store_id="qa-test-01", name="QA Test Store", team_key="overseas", is_active=True),
+                DealerStore(store_id="qa-001", name="QA Store", team_key="overseas", is_active=True),
+                DealerStore(store_id="test-store", name="Test Store", team_key="overseas", is_active=True),
+            ])
+            session.commit()
+        self.assertEqual(self._login("admin").status_code, 200)
+        response = self.client.get("/api/workbench/today?date=2024-01-02")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["closure"]["expected"], 2)
+
+    def test_workbench_uses_database_logistics_without_csv_directory(self):
+        with Session(self.engine) as session:
+            session.add(LogisticsShipment(
+                record_date="2024-01-02",
+                tracking_number="REAL123",
+                customer="Real Customer",
+                salesperson="Alice Sales",
+                current_status="",
+                judgement="异常",
+            ))
+            session.commit()
+        settings = SimpleNamespace(
+            mvp_root=Path(self.temp_dir.name),
+            config_dir=Path(self.temp_dir.name),
+            include_demo_data=False,
+        )
+        self.assertEqual(self._login("admin").status_code, 200)
+        with (
+            patch("app.database.get_engine", return_value=self.engine),
+            patch("app.logistics.service.get_settings", return_value=settings),
+        ):
+            response = self.client.get("/api/workbench/today?date=2024-01-02")
+            dates = self.client.get("/api/logistics/dates")
+        self.assertEqual(response.status_code, 200)
+        fact = response.json()["facts"]["logistics_attention"]
+        self.assertEqual(fact["state"], "available")
+        self.assertEqual(fact["value"], 1)
+        self.assertEqual(dates.json()["items"], ["2024-01-02"])
+        self.assertEqual(dates.json()["source_state"], "available")
+
+    def test_logistics_db_failure_marks_csv_fallback_degraded(self):
+        root = Path(self.temp_dir.name)
+        logistics_dir = root / "inputs" / "logistics"
+        logistics_dir.mkdir(parents=True)
+        (logistics_dir / "2024-01-02_tracking.csv").write_text(
+            "tracking_number,customer,salesperson,current_status\n"
+            "REAL123,Real Customer,Alice Sales,\n",
+            encoding="utf-8",
+        )
+        settings = SimpleNamespace(
+            mvp_root=root,
+            config_dir=root,
+            include_demo_data=False,
+        )
+        with (
+            patch("app.logistics.service.get_settings", return_value=settings),
+            patch("app.logistics.service._load_db_rows", return_value=None),
+            patch("app.logistics.service.load_auto_status_map", return_value={}),
+        ):
+            rows, state = logistics_service.load_shipments("all", return_state=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(state, "degraded")
+        self.assertEqual(rows[0]["data_source"], "csv_history")
+
+        with (
+            patch("app.logistics.service.get_settings", return_value=settings),
+            patch("app.logistics.service._load_db_rows", return_value=[]),
+            patch("app.logistics.service.load_auto_status_map", return_value={}),
+        ):
+            _rows, healthy_db_state = logistics_service.load_shipments("all", return_state=True)
+        self.assertEqual(healthy_db_state, "historical")
+
+    def test_logistics_db_failure_without_matching_history_stays_degraded(self):
+        root = Path(self.temp_dir.name) / "empty-logistics"
+        settings = SimpleNamespace(
+            mvp_root=root,
+            config_dir=root,
+            include_demo_data=False,
+        )
+        with (
+            patch("app.logistics.service.get_settings", return_value=settings),
+            patch("app.logistics.service._load_db_rows", return_value=None),
+            patch("app.logistics.service.load_auto_status_map", return_value={}),
+        ):
+            rows, state = logistics_service.load_shipments("all", return_state=True)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(state, "degraded")
+
+    def test_daily_sellout_does_not_present_monthly_snapshot_as_today(self):
+        with Session(self.engine) as session:
+            session.add(WalkinDailyReport(
+                report_date="2024-01-01",
+                dealer_id="store-a",
+                dealer_name="Dealer A",
+                deal_amount_yuan=100,
+            ))
+            session.commit()
+        self.assertEqual(self._login("admin").status_code, 200)
+        response = self.client.get("/api/dashboard/sell-out?date=2024-01-02&period=day")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIsNone(payload["wan"])
+        self.assertEqual(payload["latest_available_date"], "2024-01-01")
+
+    def test_salesperson_ranking_is_filtered_to_current_owner(self):
+        self.assertEqual(self._login("sales").status_code, 200)
+        remote = {
+            "month": "2024-01",
+            "rows": [
+                {"rank": 1, "name": "Alice Sales", "amount_wan": 12, "quantity": 2, "orders": 1},
+                {"rank": 2, "name": "Bob Sales", "amount_wan": 9, "quantity": 1, "orders": 1},
+            ],
+            "source": "vertu-cli sales +dept-breakdown",
+        }
+        with patch("app.vertu.sales.fetch_salesperson_breakdown", return_value=remote):
+            response = self.client.get("/api/dealer/sellin-salespeople?month=2024-01")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["rows"], [{
+            "rank": 1,
+            "name": "Alice Sales",
+            "amount_wan": 12,
+            "quantity": 2,
+            "orders": 1,
+        }])
+
+    def test_dashboard_periods_reject_unknown_values(self):
+        self.assertEqual(self._login("admin").status_code, 200)
+        self.assertEqual(self.client.get("/api/dashboard/overview?period=year").status_code, 422)
+        self.assertEqual(self.client.get("/api/dashboard/sell-in?period=year").status_code, 422)
+        self.assertEqual(self.client.get("/api/dashboard/sell-out?period=year").status_code, 422)
+
+    def test_scoped_daily_sellin_does_not_use_monthly_snapshot(self):
+        self.assertEqual(self._login("sales").status_code, 200)
+        response = self.client.get("/api/dashboard/sell-in?date=2024-01-02&period=day")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["wan"])
+        self.assertEqual(response.json()["state"], "missing")
+
+    def test_customer_summary_does_not_mix_stale_legacy_rows_with_acquisition(self):
+        self.settings.acquisition_enabled = True
+        self.assertEqual(self._login("sales").status_code, 200)
+        with patch(
+            "app.dashboard.router.bridge.api_customer_center_summary",
+            side_effect=AssertionError("stale legacy rows must not be shown"),
+        ):
+            response = self.client.get("/api/customer-center/summary")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
 
     def test_inactive_store_history_is_kept_but_excluded_from_current_reporting(self):
         with Session(self.engine) as session:

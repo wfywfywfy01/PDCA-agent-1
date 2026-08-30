@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>经销商进货驾驶舱 · PDCA</title>
+<title>销售人员 Sell-in 驾驶舱 · PDCA</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 :root{
@@ -152,7 +152,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
 }
 .chart-wrap{position:relative;height:220px}
 
-/* ── 经销商明细表 ── */
+/* ── 销售人员明细表 ── */
 .table-card{background:var(--surf);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
 .table-hdr{
   display:flex;align-items:center;justify-content:space-between;
@@ -223,7 +223,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
     返回
   </a>
   <div class="hdr-sep"></div>
-  <span class="hdr-title">经销商进货驾驶舱</span>
+  <span class="hdr-title">销售人员 Sell-in 驾驶舱</span>
   <span class="hdr-badge">Sell-in</span>
   <div class="hdr-tabs">
     <button class="tab-btn active" data-period="month">月报</button>
@@ -243,9 +243,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
 <!-- 主布局 -->
 <div class="layout">
 
-  <!-- 侧栏：经销商排行 -->
+  <!-- 侧栏：销售人员排行 -->
   <aside class="sidebar">
-    <div class="sb-hdr">经销商排行</div>
+    <div class="sb-hdr">销售人员排行</div>
     <div class="sb-total">
       <div class="sb-total-label">本月总进货</div>
       <div class="sb-total-val" id="sbTotal">—</div>
@@ -268,15 +268,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
         <div class="kpi-icon">📦</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">经销商数</div>
+        <div class="kpi-label">销售人员数</div>
         <div class="kpi-val" id="kpiCount">—<span>家</span></div>
-        <div class="kpi-foot" id="kpiCountFoot">参与进货</div>
+        <div class="kpi-foot" id="kpiCountFoot">有 Sell-in 记录</div>
         <div class="kpi-icon">🏪</div>
       </div>
       <div class="kpi-card c-green">
-        <div class="kpi-label">环比上月</div>
+        <div class="kpi-label">数据口径</div>
         <div class="kpi-val" id="kpiMom">—</div>
-        <div class="kpi-foot" id="kpiMomFoot">与上月对比</div>
+        <div class="kpi-foot" id="kpiMomFoot">vertu-cli 实时汇总</div>
         <div class="kpi-icon">📈</div>
       </div>
       <div class="kpi-card">
@@ -292,17 +292,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
       <!-- 趋势折线图 -->
       <div class="chart-card">
         <div class="chart-title">
-          <h3>近 6 个月进货趋势</h3>
-          <span class="chart-badge">万元</span>
+          <h3>数据说明</h3>
+          <span class="chart-badge">真实口径</span>
         </div>
         <div class="chart-wrap">
-          <canvas id="trendChart"></canvas>
+          <div class="empty-state"><div class="empty-title">按销售人员汇总</div><div class="empty-sub">客户身份受上游隐私保护，不再展示掩码客户排行。</div></div>
         </div>
       </div>
       <!-- 占比甜甜圈 -->
       <div class="chart-card">
         <div class="chart-title">
-          <h3>经销商进货占比</h3>
+          <h3>销售人员 Sell-in 占比</h3>
           <span class="chart-badge">TOP 8</span>
         </div>
         <div class="chart-wrap">
@@ -311,10 +311,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Micr
       </div>
     </div>
 
-    <!-- 经销商明细表 -->
+    <!-- 销售人员明细表 -->
     <div class="table-card">
       <div class="table-hdr">
-        <h3>经销商进货明细</h3>
+        <h3>销售人员 Sell-in 明细</h3>
         <span class="table-count" id="tableCount">—</span>
       </div>
       <div id="tableWrap">
@@ -343,11 +343,13 @@ let trendChart = null;
 let donutChart = null;
 let currentMonth = '';
 let currentData = null;
+let loadSequence = 0;
 
 // ── 工具 ──
 function fmtWan(v){ return v==null?'—': v>=10000 ? (v/10000).toFixed(1)+'亿' : v.toFixed(2)+'万' }
 function fmtNum(v){ return v==null?'—': Number(v).toLocaleString() }
 function monthLabel(m){ const p=m.split('-'); return p[1]+'月' }
+function escapeHtml(v){ return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
 
 // ── 初始化月份选择器 ──
 function initMonthPick(){
@@ -366,18 +368,26 @@ function initMonthPick(){
 
 // ── 加载数据 ──
 async function loadData(){
+  const sequence = ++loadSequence;
   const btn = document.getElementById('btnRefresh');
   btn.classList.add('loading');
+  renderEmpty();
+  document.getElementById('updTime').textContent = '加载中…';
   try {
-    const r = await fetch(`/api/dealer/sellin-summary?month=${currentMonth}`);
+    const r = await fetch(`/api/dealer/sellin-salespeople?month=${currentMonth}`);
     if(!r.ok) throw new Error('HTTP '+r.status);
-    currentData = await r.json();
+    const data = await r.json();
+    if(sequence !== loadSequence) return;
+    currentData = data;
     render(currentData);
-  } catch(e){
-    showError(e.message);
-  } finally {
-    btn.classList.remove('loading');
     document.getElementById('updTime').textContent = '更新于 '+new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+  } catch(e){
+    if(sequence !== loadSequence) return;
+    currentData = null;
+    showError(e.message);
+    document.getElementById('updTime').textContent = '更新失败';
+  } finally {
+    if(sequence === loadSequence) btn.classList.remove('loading');
   }
 }
 
@@ -387,9 +397,11 @@ function render(d){
     renderEmpty();
     return;
   }
+  d.dealers = (d.rows || []).map(x=>({
+    rank:x.rank, name:x.name, wan:x.amount_wan, quantity:x.quantity, orders:x.orders
+  }));
   renderKPI(d);
   renderSidebar(d);
-  renderTrend(d.trend);
   renderDonut(d.dealers);
   renderTable(d.dealers);
 }
@@ -404,24 +416,12 @@ function renderKPI(d){
   document.getElementById('kpiTotal').innerHTML = `${total.toFixed(1)}<span>万</span>`;
   document.getElementById('kpiTotalFoot').innerHTML = `<span>¥${(total*10000).toLocaleString('zh-CN',{maximumFractionDigits:0})} 元</span>`;
 
-  // 经销商数
-  document.getElementById('kpiCount').innerHTML = `${count}<span>家</span>`;
-  document.getElementById('kpiCountFoot').textContent = `参与本月进货`;
+  // 销售人员数
+  document.getElementById('kpiCount').innerHTML = `${count}<span>人</span>`;
+  document.getElementById('kpiCountFoot').textContent = `有 Sell-in 记录`;
 
-  // 环比
-  const trend = d.trend || [];
-  if(trend.length >= 2){
-    const cur = trend[trend.length-1].wan;
-    const prev = trend[trend.length-2].wan;
-    if(prev > 0){
-      const pct = ((cur-prev)/prev*100).toFixed(1);
-      const up = cur>=prev;
-      document.getElementById('kpiMom').innerHTML = `<span class="${up?'tag-up':'tag-dn'}">${up?'+':''}${pct}%</span>`;
-      document.getElementById('kpiMomFoot').textContent = `上月 ${prev.toFixed(1)}万`;
-    } else {
-      document.getElementById('kpiMom').textContent = '—';
-    }
-  }
+  document.getElementById('kpiMom').textContent = '实时';
+  document.getElementById('kpiMomFoot').textContent = d.source || 'vertu-cli';
 
   // 进货量
   document.getElementById('kpiQty').innerHTML = `${fmtNum(qty)}<span>台</span>`;
@@ -440,7 +440,7 @@ function renderSidebar(d){
   document.getElementById('sbList').innerHTML = dealers.slice(0,20).map((x,i)=>`
     <div class="sb-row ${i===0?'gold-1':i===1?'gold-2':i===2?'gold-3':''}">
       <span class="sb-rank ${i===0?'r1':i===1?'r2':i===2?'r3':''}">${i+1}</span>
-      <span class="sb-name" title="${x.name}">${x.name}</span>
+      <span class="sb-name" title="${escapeHtml(x.name)}">${escapeHtml(x.name)}</span>
       <span class="sb-amt">${x.wan.toFixed(1)}万</span>
     </div>
   `).join('');
@@ -506,7 +506,10 @@ function renderTrend(trend){
 }
 
 function renderDonut(dealers){
-  if(!dealers||!dealers.length) return;
+  if(!dealers||!dealers.length){
+    if(donutChart){ donutChart.destroy(); donutChart=null; }
+    return;
+  }
   const top = dealers.slice(0,8);
   const others = dealers.slice(8);
   const otherSum = others.reduce((s,x)=>s+x.wan,0);
@@ -563,7 +566,7 @@ function renderDonut(dealers){
 }
 
 function renderTable(dealers){
-  document.getElementById('tableCount').textContent = `共 ${dealers.length} 家`;
+  document.getElementById('tableCount').textContent = `共 ${dealers.length} 人`;
   if(!dealers.length){
     document.getElementById('tableWrap').innerHTML = `
       <div class="empty-state">
@@ -574,16 +577,17 @@ function renderTable(dealers){
     return;
   }
   const maxWan = dealers[0].wan || 1;
+  const totalWan = dealers.reduce((s,x)=>s+x.wan,0);
   const rows = dealers.map(d=>`
     <tr>
       <td><span class="rank-badge ${d.rank===1?'r1':d.rank===2?'r2':d.rank===3?'r3':''}">${d.rank}</span></td>
-      <td>${d.name}</td>
+      <td>${escapeHtml(d.name)}</td>
       <td class="r"><span class="wan-val">${d.wan.toFixed(2)}</span> 万</td>
       <td class="r"><span class="qty-val">${fmtNum(d.quantity)}</span></td>
       <td>
         <div class="bar-wrap">
           <div class="bar-track"><div class="bar-fill" style="width:${(d.wan/maxWan*100).toFixed(1)}%"></div></div>
-          <span class="bar-pct">${(d.wan/(dealers.reduce((s,x)=>s+x.wan,0))*100).toFixed(1)}%</span>
+          <span class="bar-pct">${(totalWan ? d.wan/totalWan*100 : 0).toFixed(1)}%</span>
         </div>
       </td>
     </tr>
@@ -593,7 +597,7 @@ function renderTable(dealers){
       <thead>
         <tr>
           <th style="width:44px">#</th>
-          <th>经销商名称</th>
+          <th>销售人员</th>
           <th class="r">进货金额</th>
           <th class="r">进货数量</th>
           <th style="min-width:160px">占比</th>
@@ -604,11 +608,12 @@ function renderTable(dealers){
 }
 
 function renderEmpty(){
+  if(donutChart){ donutChart.destroy(); donutChart=null; }
   document.getElementById('sbTotal').textContent = '—';
   document.getElementById('sbSub').textContent = '暂无数据';
   document.getElementById('sbList').innerHTML = '<div class="sb-empty">暂无数据</div>';
   document.getElementById('kpiTotal').innerHTML = '—<span>万</span>';
-  document.getElementById('kpiCount').innerHTML = '—<span>家</span>';
+  document.getElementById('kpiCount').innerHTML = '—<span>人</span>';
   document.getElementById('kpiMom').textContent = '—';
   document.getElementById('kpiQty').innerHTML = '—<span>台</span>';
   document.getElementById('tableCount').textContent = '';
@@ -616,7 +621,7 @@ function renderEmpty(){
     <div class="empty-state">
       <div class="empty-icon">📦</div>
       <div class="empty-title">本月暂无进货数据</div>
-      <div class="empty-sub">数据文件尚未生成，或所选月份无记录<br/>请确认 data_raw 目录下存在对应月份的进货数据文件</div>
+      <div class="empty-sub">所选月份暂无当前账号可见的 Sell-in 数据</div>
     </div>`;
 }
 
@@ -625,7 +630,7 @@ function showError(msg){
     <div class="empty-state">
       <div class="empty-icon">⚠️</div>
       <div class="empty-title">加载失败</div>
-      <div class="empty-sub">${msg}</div>
+      <div class="empty-sub">${escapeHtml(msg)}</div>
     </div>`;
 }
 

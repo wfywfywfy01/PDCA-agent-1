@@ -271,6 +271,21 @@ class ProductionHardeningTests(unittest.TestCase):
                 }
             )
         )
+        self.assertTrue(_is_demo_record({
+            "tracking_number": "NEW123",
+            "customer": "新客户",
+            "note": "测试",
+        }))
+        self.assertFalse(_is_demo_record({
+            "tracking_number": "REAL456",
+            "customer": "真实客户",
+            "note": "已测试清关文件，可正常使用",
+        }))
+        self.assertFalse(_is_demo_record({
+            "tracking_number": "REAL789",
+            "customer": "真实客户",
+            "note": "demo unit 已交付客户",
+        }))
 
     def test_stale_in_transit_shipment_requires_attention(self):
         row = {
@@ -330,6 +345,7 @@ class ProductionHardeningTests(unittest.TestCase):
             source = (root / "frontend" / name).read_text(encoding="utf-8")
             self.assertIn("12", source)
             self.assertNotIn("vpsBox.innerHTML", source)
+            self.assertIn('rel="icon"', source)
 
     def test_walkin_summary_excludes_currency_outlier(self):
         engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
